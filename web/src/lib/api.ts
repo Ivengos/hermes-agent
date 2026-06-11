@@ -70,6 +70,7 @@ const PROFILE_SCOPED_PREFIXES = [
   "/api/mcp",
   "/api/model/info",
   "/api/model/set",
+  "/api/model/auxiliary",
 ];
 
 function withManagementProfile(url: string): string {
@@ -636,13 +637,13 @@ export const api = {
         body: JSON.stringify({ env, profile: profile || undefined }),
       },
     ),
-  runToolsetPostSetup: (name: string, key: string) =>
+  runToolsetPostSetup: (name: string, key: string, profile?: string) =>
     fetchJSON<ActionResponse & { key: string }>(
       `/api/tools/toolsets/${encodeURIComponent(name)}/post-setup`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ key }),
+        body: JSON.stringify({ key, profile: profile || undefined }),
       },
     ),
 

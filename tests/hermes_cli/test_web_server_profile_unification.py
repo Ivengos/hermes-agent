@@ -196,6 +196,93 @@ class TestProfileScopedModel:
         if isinstance(default_model, dict):
             assert default_model.get("default") != "test/model-1"
 
+    def test_auxiliary_read_scoped_matches_write_target(
+        self, client, isolated_profiles
+    ):
+        """Reads and writes must scope symmetrically: an aux pin written to
+        the worker profile must show up ONLY in the worker-scoped read.
+        (Regression: /api/model/auxiliary used to read unscoped while
+        /api/model/set wrote scoped — the Models page displayed the
+        dashboard profile's pins while editing the selected profile's.)"""
+        (isolated_profiles["worker_beta"] / "config.yaml").write_text(
+            "auxiliary:\n  vision:\n    provider: openrouter\n"
+            "    model: worker/vision-pin\n",
+            encoding="utf-8",
+        )
+        resp = client.get("/api/model/auxiliary", params={"profile": "worker_beta"})
+        assert resp.status_code == 200
+        vision = next(t for t in resp.json()["tasks"] if t["task"] == "vision")
+        assert vision["model"] == "worker/vision-pin"
+
+        # Unscoped read = the dashboard's own profile, which has no pin.
+        resp = client.get("/api/model/auxiliary")
+        assert resp.status_code == 200
+        vision = next(t for t in resp.json()["tasks"] if t["task"] == "vision")
+        assert vision["model"] != "worker/vision-pin"
+
+    def test_auxiliary_unknown_profile_404(self, client, isolated_profiles):
+        resp = client.get("/api/model/auxiliary", params={"profile": "ghost"})
+        assert resp.status_code == 404
+
+
+class TestProfileScopedPostSetup:
+    def test_post_setup_spawns_with_profile_flag(
+        self, client, isolated_profiles, monkeypatch
+    ):
+        """Post-setup runs in a -p scoped subprocess so hooks that read
+        config / write per-profile state see the same HERMES_HOME the rest
+        of the drawer's writes targeted."""
+        import hermes_cli.web_server as web_server
+
+        calls = []
+
+        class _FakeProc:
+            pid = 777
+
+        monkeypatch.setattr(
+            web_server,
+            "_spawn_hermes_action",
+            lambda subcommand, name: calls.append(list(subcommand)) or _FakeProc(),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.tools_config.valid_post_setup_keys",
+            lambda: {"agent_browser"},
+        )
+        resp = client.post(
+            "/api/tools/toolsets/browser/post-setup",
+            json={"key": "agent_browser", "profile": "worker_beta"},
+        )
+        assert resp.status_code == 200
+        assert calls == [
+            ["-p", "worker_beta", "tools", "post-setup", "agent_browser"]
+        ]
+
+    def test_post_setup_without_profile_keeps_legacy_argv(
+        self, client, isolated_profiles, monkeypatch
+    ):
+        import hermes_cli.web_server as web_server
+
+        calls = []
+
+        class _FakeProc:
+            pid = 777
+
+        monkeypatch.setattr(
+            web_server,
+            "_spawn_hermes_action",
+            lambda subcommand, name: calls.append(list(subcommand)) or _FakeProc(),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.tools_config.valid_post_setup_keys",
+            lambda: {"agent_browser"},
+        )
+        resp = client.post(
+            "/api/tools/toolsets/browser/post-setup",
+            json={"key": "agent_browser"},
+        )
+        assert resp.status_code == 200
+        assert calls == [["tools", "post-setup", "agent_browser"]]
+
 
 class TestProfileScopedChatPty:
     def test_chat_argv_scopes_hermes_home(self, isolated_profiles, monkeypatch):
@@ -207,6 +294,7 @@ class TestProfileScopedChatPty:
             raising=False,
         )
         argv, cwd, env = web_server._resolve_chat_argv(profile="worker_beta")
+        assert env is not None
         assert env["HERMES_HOME"] == str(isolated_profiles["worker_beta"])
         # Scoped chat must NOT attach to the dashboard's in-memory gateway.
         assert "HERMES_TUI_GATEWAY_URL" not in env
@@ -220,10 +308,10 @@ class TestProfileScopedChatPty:
             raising=False,
         )
         argv, cwd, env = web_server._resolve_chat_argv()
+        assert env is not None
         assert env.get("HERMES_HOME") != str(isolated_profiles["worker_beta"])
 
     def test_chat_argv_unknown_profile_raises(self, isolated_profiles, monkeypatch):
-        from fastapi import HTTPException
         import hermes_cli.web_server as web_server
 
         monkeypatch.setattr(
@@ -231,6 +319,8 @@ class TestProfileScopedChatPty:
             lambda root, tui_dev=False: (["cat"], None),
             raising=False,
         )
-        with pytest.raises(HTTPException) as exc:
+        # Reuse the HTTPException class web_server itself raises — avoids a
+        # direct fastapi import (unresolvable in the ty lint environment).
+        with pytest.raises(web_server.HTTPException) as exc:
             web_server._resolve_chat_argv(profile="ghost")
         assert exc.value.status_code == 404

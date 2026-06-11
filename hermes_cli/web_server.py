@@ -2735,7 +2735,7 @@ def get_recommended_default_model(provider: str = ""):
 
 
 @app.get("/api/model/auxiliary")
-def get_auxiliary_models():
+def get_auxiliary_models(profile: Optional[str] = None):
     """Return current auxiliary task assignments.
 
     Shape:
@@ -2746,9 +2746,14 @@ def get_auxiliary_models():
         ],
         "main": {"provider": "openrouter", "model": "anthropic/claude-opus-4.7"},
       }
+
+    ``profile`` scopes the read — without it, the Models page would show
+    the dashboard profile's auxiliary pins while /api/model/set wrote the
+    selected profile's (read/write asymmetry).
     """
     try:
-        cfg = load_config()
+        with _profile_scope(profile):
+            cfg = load_config()
         aux_cfg = cfg.get("auxiliary", {})
         if not isinstance(aux_cfg, dict):
             aux_cfg = {}
@@ -2773,6 +2778,8 @@ def get_auxiliary_models():
             main = {"provider": "", "model": str(model_cfg) if model_cfg else ""}
 
         return {"tasks": tasks, "main": main}
+    except HTTPException:
+        raise
     except Exception:
         _log.exception("GET /api/model/auxiliary failed")
         raise HTTPException(status_code=500, detail="Failed to read auxiliary config")
@@ -8790,10 +8797,13 @@ async def save_toolset_env(name: str, body: ToolsetEnvUpdate, profile: Optional[
 
 class ToolsetPostSetup(BaseModel):
     key: str
+    profile: Optional[str] = None
 
 
 @app.post("/api/tools/toolsets/{name}/post-setup")
-async def run_toolset_post_setup(name: str, body: ToolsetPostSetup):
+async def run_toolset_post_setup(
+    name: str, body: ToolsetPostSetup, profile: Optional[str] = None
+):
     """Spawn a provider's post-setup install hook as a background action.
 
     Post-setup hooks (npm install for browser/Camofox, pip install for
@@ -8803,6 +8813,12 @@ async def run_toolset_post_setup(name: str, body: ToolsetPostSetup):
     ``GET /api/actions/tools-post-setup/status``. The ``key`` is validated
     against the declared post-setup allowlist before spawning. Returns 400
     for unknown toolset or post-setup key.
+
+    ``profile`` spawns the hook as ``hermes -p <profile> tools post-setup``.
+    Most hooks install machine-level artifacts (repo node_modules, shared
+    pip packages) where the scope is inert, but hooks that read config or
+    write per-profile state must see the same HERMES_HOME the rest of the
+    drawer's writes targeted — so the scope is threaded for consistency.
     """
     from hermes_cli.tools_config import (
         _get_effective_configurable_toolsets,
@@ -8820,8 +8836,12 @@ async def run_toolset_post_setup(name: str, body: ToolsetPostSetup):
 
     try:
         proc = _spawn_hermes_action(
-            ["tools", "post-setup", body.key], "tools-post-setup"
+            _profile_cli_args(profile or body.profile)
+            + ["tools", "post-setup", body.key],
+            "tools-post-setup",
         )
+    except HTTPException:
+        raise
     except Exception as exc:
         _log.exception("Failed to spawn tools post-setup")
         raise HTTPException(
