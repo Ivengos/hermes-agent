@@ -3441,18 +3441,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return 0
         rehydrated_count = 0
         for row in rows:
-            session_key, _position, text, _platform, _user_id, _chat_id, queued_at = row
+            session_key, _position, text, platform, user_id, chat_id, queued_at = row
             queued_events = getattr(self, "_queued_events", None)
             if queued_events is None:
                 queued_events = {}
                 self._queued_events = queued_events
-            placeholder = SimpleNamespace(
+            # Build a REAL MessageEvent so the FIFO path can read .text and
+            # .source WITHOUT the active-session shortcut later crashing on
+            # missing get_command(). The old SimpleNamespace stub worked
+            # only as long as the FIFO consumer did not branch on the
+            # event's command type — base.py:3883 does, so we must comply.
+            from gateway.platforms.base import MessageEvent, MessageType
+            from gateway.session import Platform, SessionSource
+            try:
+                src = SessionSource(
+                    platform=Platform(platform) if platform else Platform.LOCAL,
+                    user_id=str(user_id) if user_id else None,
+                    chat_id=str(chat_id) if chat_id else "unknown",
+                )
+            except (ValueError, TypeError) as exc:
+                logger.debug(
+                    "Queue rehydrate: dropping row with bad source platform=%r: %s",
+                    platform, exc,
+                )
+                continue
+            placeholder = MessageEvent(
                 text=text,
-                source=None,
+                source=src,
                 message_id=None,
                 channel_prompt=None,
-                _queued_at=queued_at,
+                message_type=MessageType.TEXT,
             )
+            placeholder._queued_at = queued_at  # type: ignore[attr-defined]
             queued_events.setdefault(session_key, []).append(placeholder)
             rehydrated_count += 1
         if rehydrated_count:

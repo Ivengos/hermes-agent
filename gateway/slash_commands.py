@@ -590,20 +590,27 @@ class GatewaySlashCommandsMixin:
         if not callable(enqueue_fn) or adapter is None:
             return "Queueing is not available in this build."
 
-        # Build a minimal MessageEvent-shaped object.  We use a SimpleNamespace
-        # so the FIFO path can read .text and .source without us instantiating
-        # the full Pydantic event class (the FIFO path only reads those two).
-        from types import SimpleNamespace
+        # Build a real MessageEvent so the FIFO path AND the active-session
+        # shortcut (base.py:3883) can read .text/.source AND call
+        # .get_command()/.is_command()/.get_command_args() without crashing.
+        # The pre-fix SimpleNamespace stub was a fragile shortcut that
+        # relied on the FIFO consumer not branching on command type — when
+        # the active-session branch in handle_message() started reading
+        # get_command() it broke.  The cost of building a real MessageEvent
+        # is negligible (Pydantic-free dataclass, ~6 fields) and the gain
+        # is that every downstream consumer can treat the queued item
+        # exactly like a fresh inbound message.
+        from gateway.platforms.base import MessageEvent, MessageType
 
         text = raw_args  # the full text, not just the first token
         if not text:
             return "Use `/queue <text>` to add a message to the queue."
-        queued_event = SimpleNamespace(
+        queued_event = MessageEvent(
             text=text,
             source=source,
             message_id=None,
             channel_prompt=None,
-            message_type=None,
+            message_type=MessageType.TEXT,
         )
         # Stamp the queued_at for TTL tracking; FIFO does this too but
         # doing it here means the timestamp is set before the depth check

@@ -640,3 +640,134 @@ class TestQueueEndToEnd:
             (session_key,),
         ).fetchone()
         assert rows[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# Regression: rehydrator + explicit-enqueue must build real MessageEvents.
+#
+# Background: the original PR #44177 used ``types.SimpleNamespace`` as a
+# "fast" stand-in, with a comment claiming the FIFO consumer only reads
+# .text and .source.  That was wrong: BasePlatformAdapter.handle_message()
+# reads event.get_command() in its active-session shortcut at
+# gateway/platforms/base.py:3883 BEFORE the FIFO consumer runs.  SimpleNamespace
+# has no get_command, so the user got "Sorry, I encountered an error
+# (AttributeError)" and the queued message was silently dropped.
+#
+# These tests pin the contract that the two stub generators (the SQLite
+# rehydrator in run.py:_rehydrate_queue_persistence and the explicit-enqueue
+# path in slash_commands.py) produce *real* MessageEvent instances, so the
+# active-session shortcut, the FIFO consumer, and any future call site
+# all see a fully-functional event.
+# ---------------------------------------------------------------------------
+
+
+def test_rehydrate_builds_real_message_events(tmp_path):
+    """The SQLite -> in-memory rehydrator must produce real MessageEvents,
+    not SimpleNamespace stubs. Real MessageEvents expose is_command(),
+    get_command(), and get_command_args() that the active-session shortcut
+    in handle_message() depends on."""
+    runner, _adapter, _session_key = _make_runner(tmp_path)
+    # Simulate a SIGKILL restart: write rows directly to SQLite (no in-mem
+    # state to seed from), then rehydrate.
+    conn = runner._ensure_queue_persistence_db()
+    conn.execute(
+        "INSERT INTO queue_persistence "
+        "(session_key, position, text, source_platform, source_user_id, "
+        " source_chat_id, queued_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("telegram:u1:c1", 0, "/hello world", "telegram", "u1", "c1", 1_700_000_000.0),
+    )
+    conn.execute(
+        "INSERT INTO queue_persistence "
+        "(session_key, position, text, source_platform, source_user_id, "
+        " source_chat_id, queued_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("telegram:u1:c1", 1, "plain text no command", "telegram", "u1", "c1",
+         1_700_000_001.0),
+    )
+    conn.commit()
+
+    n = runner._rehydrate_queue_persistence()
+    assert n == 2
+
+    rehydrated = runner._queued_events["telegram:u1:c1"]
+    assert len(rehydrated) == 2
+
+    # Every rehydrated item must be a real MessageEvent.  If we accidentally
+    # re-introduce SimpleNamespace stubs this assertion will fail and the
+    # active-session crash returns.
+    for ev in rehydrated:
+        assert isinstance(ev, MessageEvent), (
+            f"rehydrator produced {type(ev).__name__}, not MessageEvent — "
+            "this is exactly the SimpleNamespace regression from the bug."
+        )
+
+    # The methods that the active-session shortcut (base.py:3883) calls
+    # must work and return the right values. get_command_args() returns
+    # a str (per the real MessageEvent contract at base.py:1487-1495),
+    # not a list — my earlier plugin polyfill was wrong about that.
+    cmd_event = rehydrated[0]
+    assert cmd_event.is_command() is True
+    assert cmd_event.get_command() == "hello"
+    assert cmd_event.get_command_args() == "world"
+
+    plain_event = rehydrated[1]
+    assert plain_event.is_command() is False
+    assert plain_event.get_command() is None
+    # Real MessageEvent contract: get_command_args() returns the full text
+    # for non-commands (see base.py:1490). The legacy polyfill I wrote
+    # in the v0.1.1 queue_shim plugin returned [] for non-commands —
+    # wrong, but it didn't matter for the crash because the polyfill was
+    # already too late in the lifecycle. Still: now that the stub
+    # generator is fixed at the root, we hold the real contract.
+    assert plain_event.get_command_args() == "plain text no command"
+
+
+def test_rehydrate_survives_active_session_shortcut(tmp_path):
+    """End-to-end regression: simulate the exact failure Ivan hit.
+    Build a rehydrated queue, then call the same line that crashed in
+    base.py:3883. Pre-fix this raised AttributeError. Post-fix the line
+    returns cleanly because the rehydrated event is a real MessageEvent."""
+    runner, adapter, _session_key = _make_runner(tmp_path)
+    conn = runner._ensure_queue_persistence_db()
+    conn.execute(
+        "INSERT INTO queue_persistence "
+        "(session_key, position, text, source_platform, source_user_id, "
+        " source_chat_id, queued_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("telegram:u1:c1", 0, "/test", "telegram", "u1", "c1", 1_700_000_000.0),
+    )
+    conn.commit()
+    runner._rehydrate_queue_persistence()
+
+    ev = runner._queued_events["telegram:u1:c1"][0]
+    # This is the line that used to raise AttributeError on SimpleNamespace
+    # stubs. With real MessageEvent instances it returns the command name.
+    cmd = ev.get_command()
+    assert cmd == "test", f"active-session shortcut would crash: got cmd={cmd!r}"
+
+
+def test_rehydrate_drops_malformed_source_rows(tmp_path):
+    """The rehydrator must not crash the gateway on a row with a bogus
+    source platform (e.g. a stale DB from an older Hermes version where
+    the source_platform column was a different enum value). Drops the
+    bad row, keeps the good one."""
+    runner, _adapter, _session_key = _make_runner(tmp_path)
+    conn = runner._ensure_queue_persistence_db()
+    conn.execute(
+        "INSERT INTO queue_persistence "
+        "(session_key, position, text, source_platform, source_user_id, "
+        " source_chat_id, queued_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("telegram:u1:c1", 0, "/good", "telegram", "u1", "c1", 1.0),
+    )
+    conn.execute(
+        "INSERT INTO queue_persistence "
+        "(session_key, position, text, source_platform, source_user_id, "
+        " source_chat_id, queued_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("telegram:u1:c1", 1, "bad source", "platform-that-doesnt-exist",
+         "u1", "c1", 2.0),
+    )
+    conn.commit()
+
+    n = runner._rehydrate_queue_persistence()
+    # The good row is rehydrated, the bad one is logged-and-skipped.
+    assert n == 1
+    assert len(runner._queued_events["telegram:u1:c1"]) == 1
+    assert runner._queued_events["telegram:u1:c1"][0].text == "/good"
