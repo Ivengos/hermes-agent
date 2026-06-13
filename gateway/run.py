@@ -3213,8 +3213,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _QUEUE_DEFAULT_TTL_SECONDS = 24 * 60 * 60  # 24h — Follow-up 1
     _QUEUE_TTL_CHECK_INTERVAL = 50  # every Nth enqueue — cheap amortized
 
-    _queue_ttl_check_counter: int = 0
-
     def _check_queue_capacity(self, session_key: str, *, adapter: Any) -> Optional[str]:
         """Return an error string if the queue is at hard capacity, else None.
 
