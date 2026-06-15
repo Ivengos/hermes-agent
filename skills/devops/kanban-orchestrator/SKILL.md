@@ -1,7 +1,7 @@
 ---
 name: kanban-orchestrator
 description: Decomposition playbook + anti-temptation rules for an orchestrator profile routing work through Kanban. The "don't do the work yourself" rule and the basic lifecycle are auto-injected into every kanban worker's system prompt; this skill is the deeper playbook when you're specifically playing the orchestrator role.
-version: 3.0.0
+version: 3.1.0
 platforms: [linux, macos, windows]
 environments: [kanban]
 metadata:
@@ -160,6 +160,84 @@ Tell them what you created in plain prose, naming the actual profiles you used:
 **Same-profile queue:** N tasks, all assigned to the same profile, no dependencies between them. Dispatcher serializes — that profile processes them in priority order, accumulating experience in its own memory.
 
 **Human-in-the-loop:** Any task can `kanban_block()` to wait for input. Dispatcher respawns after `/unblock`. The comment thread carries the full context.
+
+## Sizing the iteration budget
+
+Every dispatched worker has a per-task **iteration budget** — the cap on tool-calling turns it may consume before the dispatcher marks the run `gave_up` and re-queues it. The default is 90 (set in `agent/agent_init.py:165` as `max_iterations`).
+
+Hitting the budget is one of the most common causes of multi-attempt siblings in a swarm: a worker with a 3-deliverable contract burns through ~100–120 turns on a clean first attempt, gets killed at 90, the dispatcher claims failure, and the same card is re-queued. The swarm then pays double the wall-clock cost and the operator gets a noisy "Iteration budget exhausted (90/90)" event in the audit log.
+
+### Recommended sizes
+
+| Deliverables in worker body | Recommended `max_iterations` |
+| --- | --- |
+| 1–2 | 90 (default) |
+| 3–4 | 120 |
+| 5+ | 150+ |
+
+A "deliverable" is anything the contract body names explicitly: numbered items (`Deliverable 1: …`, `Deliverable 2: …`), unnumbered markdown headers (`## Deliverable` / `### Deliverable`), or even bullet points that look like a numbered plan. When in doubt, round up — a false positive just gives the worker a slightly larger budget; a false negative forces a retry.
+
+### Smart default (the swarm helper applies this for you)
+
+`hermes_cli/kanban_swarm.py` ships a heuristic: when you call `create_swarm(...)` with `SwarmWorkerSpec` workers, the helper counts deliverables in each worker's body and applies 120 to the card automatically when the count is ≥3. You don't have to do anything — but you can override it.
+
+```python
+from hermes_cli.kanban_swarm import SwarmWorkerSpec, create_swarm
+
+# Body with 3 deliverables → 120 applied automatically
+spec = SwarmWorkerSpec(profile="frontend", title="...", body=body)
+
+# Body with 1 deliverable → None (use global 90)
+spec_small = SwarmWorkerSpec(profile="researcher", title="...", body=body)
+
+# Pin a specific budget (overrides the heuristic)
+spec_big = SwarmWorkerSpec(
+    profile="integrator",
+    title="...",
+    body=body,
+    max_iterations=180,  # explicit override
+)
+```
+
+The helper is intentionally generous: a false positive is harmless (slightly more headroom), and a false negative is the failure mode we are trying to avoid.
+
+### CLI / programmatic override
+
+If you create a card directly via the CLI or `kanban_create()`, pass `--max-iterations N` (CLI) or `max_iterations=N` (programmatic):
+
+```bash
+hermes kanban create "Frontend contract — 3 deliverables" \
+    --assignee frontend \
+    --max-iterations 120 \
+    --body "..."
+```
+
+```python
+kanban_create(
+    title="Integration contract — 4 deliverables",
+    assignee="integration",
+    body="...",
+    max_iterations=120,
+)
+```
+
+When set, the dispatcher injects `HERMES_MAX_ITERATIONS=<N>` into the worker subprocess so its chat entry uses `N` instead of the global 90. The wiring is covered by `tests/hermes_cli/_test_dispatcher_env_wiring.py` (3 cases: explicit set, explicit None, explicit 90).
+
+### When the heuristic is wrong
+
+The deliverable counter is a heuristic. If your contract body has a different shape (e.g. "Phase 1 / Phase 2 / Phase 3" instead of "Deliverable 1 / 2 / 3"), the counter returns 0 and the worker gets the 90 default. In that case:
+
+1. Add an explicit `max_iterations=` to the spec / CLI flag, OR
+2. Add a "Deliverable N" header to the contract body so the counter picks it up.
+
+### Verifying the budget is honored
+
+Two quick ways to confirm a card has the right budget before dispatch:
+
+- `hermes kanban show <task_id> --json` — look at the `max_iterations` field on the task row.
+- The worker subprocess's env (visible in the dispatcher's claim event payload) will include `HERMES_MAX_ITERATIONS=<N>` if set.
+
+If the worker still hits 90/90, the budget is being shadowed by something else (stale `.env` ghost, profile config, etc.) — see `hermes doctor` and the gateway's `test_config_env_bridge_authority.py` regression guards.
 
 ## Pitfalls
 
