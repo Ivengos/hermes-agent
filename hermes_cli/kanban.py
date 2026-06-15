@@ -326,6 +326,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "durations (90s, 30m, 2h, 1d). When exceeded, "
                                "the dispatcher SIGTERMs (then SIGKILLs) the worker "
                                "and re-queues the task.")
+    p_create.add_argument("--max-iterations", type=int, default=None,
+                          metavar="N",
+                          help="Override the worker's tool-calling iteration "
+                               "budget for this task only. The dispatcher "
+                               "injects it as HERMES_MAX_ITERATIONS=<N> so the "
+                               "worker's chat entry uses N instead of the "
+                               "profile / global default. Use 120 for tasks "
+                               "with 3-4 deliverables, 150+ for 5+, omit for "
+                               "the default 90. See kanban-orchestrator skill: "
+                               "\"Sizing the iteration budget\".")
     p_create.add_argument("--created-by", default="user",
                           help="Author name recorded on the task (default: user)")
     p_create.add_argument("--skill", action="append", default=[], dest="skills",
@@ -1317,6 +1327,14 @@ def _cmd_create(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"kanban: --max-runtime: {exc}", file=sys.stderr)
         return 2
+    max_iterations = getattr(args, "max_iterations", None)
+    if max_iterations is not None and max_iterations < 1:
+        print(
+            f"kanban: --max-iterations must be >= 1 (got {max_iterations}); "
+            "omit the flag to use the global default (90).",
+            file=sys.stderr,
+        )
+        return 2
     max_retries = getattr(args, "max_retries", None)
     if max_retries is not None and max_retries < 1:
         print(
@@ -1343,6 +1361,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             max_runtime_seconds=max_runtime,
             skills=getattr(args, "skills", None) or None,
             max_retries=max_retries,
+            max_iterations=max_iterations,
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),

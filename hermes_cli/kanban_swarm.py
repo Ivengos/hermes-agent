@@ -36,6 +36,24 @@ class SwarmWorkerSpec:
     skills: list[str] = field(default_factory=list)
     priority: int = 0
     max_runtime_seconds: Optional[int] = None
+    # Per-worker override for the tool-calling iteration budget.
+    # ``None`` (default) — the swarm helper applies a smart default
+    # based on the worker's deliverable count (see
+    # ``_default_max_iterations``): ≥3 deliverables in the body raises
+    # it to 120 so multi-deliverable contracts don't blow the 90-turn
+    # default on the first attempt. Pass an explicit value to override
+    # the heuristic; pass 90 (or whatever the global default is) to
+    # force the default.
+    max_iterations: Optional[int] = None
+
+
+# Smart-default for the swarm helper. Sibling workers in a swarm that
+# list ≥3 deliverables in their contract body burn through the global
+# 90-turn default on the first attempt and need a retry — the swarm
+# root then reaps the cost of the second attempt. Apply 120 up front
+# for the multi-deliverable case so the worker finishes on attempt #1.
+_MULTI_DELIVERABLE_ITERATION_BUDGET = 120
+_MULTI_DELIVERABLE_THRESHOLD = 3
 
 
 @dataclass(frozen=True)
@@ -61,6 +79,59 @@ def _require_text(value: str, field_name: str) -> str:
     if not text:
         raise ValueError(f"{field_name} is required")
     return text
+
+
+def _count_deliverables(body: str) -> int:
+    """Heuristic: how many distinct deliverables does this worker owe?
+
+    Looks for the patterns most commonly used in Design §6 contracts:
+
+    - "Deliverable 1", "Deliverable 2", ... (numbered)
+    - "## Deliverable" / "### Deliverable" markdown headers
+    - Top-level numbered list items that begin with "Deliverable N: …"
+    - "deliverable 1", "deliverable 2", ... (case-insensitive, ≥1 token apart)
+
+    The match is intentionally generous: a real swarm contract almost
+    always uses one of these forms, and a false positive is harmless —
+    the worker just gets a slightly larger budget. A false negative
+    (missing a contract that does need 120 turns) is what we are trying
+    to avoid, so we err on the side of counting more.
+    """
+    import re
+
+    if not body:
+        return 0
+    # Case-insensitive; matches "Deliverable 1", "deliverable-3:",
+    # "**DELIVERABLE 2** — …", "## Deliverable 4", "deliverable 1.", etc.
+    pattern = re.compile(
+        r"\bdeliverable[\s\-:.]*(\d+)\b",
+        re.MULTILINE | re.IGNORECASE,
+    )
+    numbers = {int(m.group(1)) for m in pattern.finditer(body)}
+    if not numbers:
+        # Fallback: count markdown-style "## Deliverable" headers even
+        # when they are not numbered.
+        header_pattern = re.compile(
+            r"^#{1,6}\s+deliverable\b",
+            re.MULTILINE | re.IGNORECASE,
+        )
+        return len(header_pattern.findall(body))
+    return max(numbers) if numbers else 0
+
+
+def _default_max_iterations(spec: "SwarmWorkerSpec") -> Optional[int]:
+    """Return the iteration budget to use for ``spec``, applying the
+    multi-deliverable heuristic when ``spec.max_iterations`` is unset.
+
+    The caller (orchestrator profile) can override the heuristic by
+    passing an explicit value; this function only fills in the default.
+    """
+    if spec.max_iterations is not None:
+        return int(spec.max_iterations)
+    deliverable_count = _count_deliverables(spec.body or "")
+    if deliverable_count >= _MULTI_DELIVERABLE_THRESHOLD:
+        return _MULTI_DELIVERABLE_ITERATION_BUDGET
+    return None  # defer to the global default (currently 90)
 
 
 def _swarm_context(root_id: str, goal: str) -> str:
@@ -157,6 +228,11 @@ def create_swarm(
     context_suffix = _swarm_context(root, goal)
     worker_ids: list[str] = []
     for spec in worker_specs:
+        # Apply the multi-deliverable heuristic unless the caller
+        # already pinned a budget. ``_default_max_iterations`` returns
+        # ``None`` for single- or two-deliverable contracts, which
+        # leaves the global default (90) in effect.
+        worker_max_iterations = _default_max_iterations(spec)
         worker_id = kb.create_task(
             conn,
             title=spec.title,
@@ -170,6 +246,7 @@ def create_swarm(
             workspace_path=workspace_path,
             skills=spec.skills or None,
             max_runtime_seconds=spec.max_runtime_seconds,
+            max_iterations=worker_max_iterations,
         )
         worker_ids.append(worker_id)
 
