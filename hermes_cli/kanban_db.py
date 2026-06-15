@@ -764,6 +764,14 @@ class Task:
     # just spawn). Pre-rename column: ``last_spawn_error``.
     last_failure_error: Optional[str] = None
     max_runtime_seconds: Optional[int] = None
+    # Per-task override for the worker's tool-calling iteration budget.
+    # When set, the dispatcher injects ``HERMES_MAX_ITERATIONS=<n>`` into
+    # the worker subprocess so its chat entry uses ``n`` instead of the
+    # profile / global default. ``None`` = use the global default
+    # (currently 90). Recommended values: 90 for ≤2 deliverables, 120
+    # for 3-4 deliverables, 150+ for 5+. See kanban-orchestrator skill:
+    # "Sizing the iteration budget".
+    max_iterations: Optional[int] = None
     last_heartbeat_at: Optional[int] = None
     current_run_id: Optional[int] = None
     workflow_template_id: Optional[str] = None
@@ -849,6 +857,9 @@ class Task:
             ),
             max_runtime_seconds=(
                 row["max_runtime_seconds"] if "max_runtime_seconds" in keys else None
+            ),
+            max_iterations=(
+                row["max_iterations"] if "max_iterations" in keys else None
             ),
             last_heartbeat_at=(
                 row["last_heartbeat_at"] if "last_heartbeat_at" in keys else None
@@ -999,6 +1010,15 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Short excerpt of the most recent failure's error text.
     last_failure_error   TEXT,
     max_runtime_seconds  INTEGER,
+    -- Per-task override for the worker's tool-calling iteration budget.
+    -- The dispatcher injects this into the worker subprocess as
+    -- ``HERMES_MAX_ITERATIONS`` (which the chat entry already honours
+    -- as a fallback when ``agent.max_turns`` and the CLI flag are both
+    -- unset). NULL = use the global default (currently 90). Sibling
+    -- tasks in a swarm that deliver ≥ 3 artefacts should set this to
+    -- 120 or more to avoid the budget-exhausted retry pattern (see
+    -- kanban-orchestrator skill: "Sizing the iteration budget").
+    max_iterations       INTEGER,
     last_heartbeat_at    INTEGER,
     -- Pointer into task_runs for the currently-active run (NULL if no
     -- run is in-flight). Denormalised for cheap reads.
@@ -1637,6 +1657,18 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "max_runtime_seconds", "max_runtime_seconds INTEGER"
         )
+    if "max_iterations" not in cols:
+        # Per-task override for the worker's tool-calling iteration
+        # budget. The dispatcher injects this into the worker subprocess
+        # as ``HERMES_MAX_ITERATIONS`` (which the chat entry already
+        # honours as a fallback when ``agent.max_turns`` and the CLI
+        # flag are both unset). NULL = use the global default (currently
+        # 90). Existing rows get NULL, which preserves their pre-column
+        # behaviour. See kanban-orchestrator skill: "Sizing the
+        # iteration budget" for the ≥3-deliverable heuristic.
+        _add_column_if_missing(
+            conn, "tasks", "max_iterations", "max_iterations INTEGER"
+        )
     if "last_heartbeat_at" not in cols:
         _add_column_if_missing(
             conn, "tasks", "last_heartbeat_at", "last_heartbeat_at INTEGER"
@@ -2067,6 +2099,7 @@ def create_task(
     max_runtime_seconds: Optional[int] = None,
     skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None,
+    max_iterations: Optional[int] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
@@ -2089,6 +2122,14 @@ def create_task(
     ``max_runtime_seconds`` caps how long a worker may run before the
     dispatcher SIGTERMs (then SIGKILLs after a grace window) and
     re-queues the task. ``None`` means no cap (default).
+
+    ``max_iterations`` overrides the worker's tool-calling iteration
+    budget for this task only. The dispatcher injects it as the
+    ``HERMES_MAX_ITERATIONS`` env var (which the chat entry already
+    honours as a fallback when ``agent.max_turns`` and the CLI flag
+    are both unset). ``None`` = use the global default (currently 90).
+    Recommended values: 90 for ≤2 deliverables, 120 for 3-4, 150+ for
+    5+. See kanban-orchestrator skill: "Sizing the iteration budget".
 
     ``skills`` is an optional list of skill names to force-load into
     the worker when dispatched. Stored as JSON; the dispatcher passes
@@ -2113,6 +2154,16 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+    if max_iterations is not None:
+        if not isinstance(max_iterations, int) or isinstance(max_iterations, bool):
+            raise ValueError(
+                f"max_iterations must be an int (got {type(max_iterations).__name__})"
+            )
+        if max_iterations < 1:
+            raise ValueError(
+                f"max_iterations must be >= 1 (got {max_iterations}); "
+                "use 1 only if you want the worker to fail fast on the first turn"
+            )
     parents = tuple(p for p in parents if p)
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
@@ -2236,8 +2287,9 @@ def create_task(
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, tenant, idempotency_key, max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        max_iterations, skills, max_retries, goal_mode,
+                        goal_max_turns, session_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2254,6 +2306,7 @@ def create_task(
                         tenant,
                         idempotency_key,
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
+                        int(max_iterations) if max_iterations is not None else None,
                         json.dumps(skills_list) if skills_list is not None else None,
                         int(max_retries) if max_retries is not None else None,
                         1 if goal_mode else 0,
@@ -6751,6 +6804,15 @@ def _default_spawn(
     )
     if foreground_timeout is not None:
         env["TERMINAL_MAX_FOREGROUND_TIMEOUT"] = foreground_timeout
+    # Per-task tool-calling iteration budget override. The chat entry
+    # in cli.py already honours ``HERMES_MAX_ITERATIONS`` as a fallback
+    # (below ``agent.max_turns`` and the CLI ``--max-turns`` flag), so
+    # setting it here is sufficient to retarget a specific task without
+    # touching the profile or the global default. Only set when
+    # non-None so we don't shadow a parent-provided value (e.g. the
+    # gateway / cron job may have set it for its own reasons).
+    if task.max_iterations is not None:
+        env["HERMES_MAX_ITERATIONS"] = str(int(task.max_iterations))
     # Pin the shared board + workspaces root the dispatcher resolved, so
     # that even when the worker activates a profile (`hermes -p <name>`
     # rewrites HERMES_HOME), its kanban paths still match the
