@@ -88,27 +88,62 @@ def finalize_turn(
                 from hermes_cli import kanban_db as _kb
                 _conn = _kb.connect()
                 try:
-                    _kb._record_task_failure(
-                        _conn,
-                        _kanban_task,
-                        error=(
-                            f"Iteration budget exhausted "
-                            f"({api_call_count}/{agent.max_iterations}) — "
-                            "task could not complete within the allowed "
-                            "iterations"
-                        ),
-                        outcome="timed_out",
-                        release_claim=True,
-                        end_run=True,
-                        event_payload_extra={
-                            "budget_used": api_call_count,
-                            "budget_max": agent.max_iterations,
-                        },
-                    )
-                    logger.info(
-                        "recorded budget-exhausted failure for task %s (%d/%d)",
-                        _kanban_task, api_call_count, agent.max_iterations,
-                    )
+                    # Native budget escalation (replaces the bolt-on monitor):
+                    # if the worker exhausted its iteration budget but is still
+                    # BELOW the escalation cap, raise the task's max_iterations
+                    # and re-queue for a fresh spawn at the higher budget —
+                    # instead of recording a failure + blocking. This never
+                    # touches parked/blocked tasks (only the actively-running
+                    # one here) and does NOT advance the failure breaker. Only
+                    # at the cap (next tier == None) do we fall through to the
+                    # original block-for-human path.
+                    _next = _kb.next_budget_tier(agent.max_iterations)
+                    _escalated = False
+                    if _next is not None:
+                        try:
+                            _escalated = _kb.escalate_and_requeue(
+                                _conn,
+                                _kanban_task,
+                                _next,
+                                reason=(
+                                    f"iteration budget exhausted "
+                                    f"({api_call_count}/{agent.max_iterations})"
+                                ),
+                            )
+                        except Exception as _esc_exc:
+                            logger.warning(
+                                "budget escalation failed for task %s (%s); "
+                                "falling back to failure path",
+                                _kanban_task, _esc_exc,
+                            )
+                    if _escalated:
+                        logger.info(
+                            "budget-escalated task %s %s->%s; re-queued for a "
+                            "fresh spawn at the higher budget",
+                            _kanban_task, agent.max_iterations, _next,
+                        )
+                    else:
+                        _kb._record_task_failure(
+                            _conn,
+                            _kanban_task,
+                            error=(
+                                f"Iteration budget exhausted "
+                                f"({api_call_count}/{agent.max_iterations}) — "
+                                "task could not complete within the allowed "
+                                "iterations"
+                            ),
+                            outcome="timed_out",
+                            release_claim=True,
+                            end_run=True,
+                            event_payload_extra={
+                                "budget_used": api_call_count,
+                                "budget_max": agent.max_iterations,
+                            },
+                        )
+                        logger.info(
+                            "recorded budget-exhausted failure for task %s (%d/%d)",
+                            _kanban_task, api_call_count, agent.max_iterations,
+                        )
                 finally:
                     try:
                         _conn.close()
