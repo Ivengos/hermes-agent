@@ -3449,6 +3449,72 @@ def reclaim_task(
     return True
 
 
+# ── Budget escalation (native auto-heal) ────────────────────────────
+# Ladder above the global iteration-budget default (90). Overridable later
+# via kanban.budget_escalation_tiers config; the top entry is the cap beyond
+# which a budget-exhausted task blocks for a human instead of escalating.
+DEFAULT_BUDGET_ESCALATION_TIERS = (120, 150, 200)
+
+
+def next_budget_tier(current, tiers=DEFAULT_BUDGET_ESCALATION_TIERS):
+    """Next escalation tier strictly above ``current`` (90->120->150->200), or
+    ``None`` when already at/above the top tier (cap reached → block for human)."""
+    try:
+        cur = int(current or 0)
+    except (TypeError, ValueError):
+        return None
+    return next((t for t in tiers if t > cur), None)
+
+
+def escalate_and_requeue(conn, task_id, new_max_iterations, *, reason=None):
+    """A still-running worker exhausted its iteration budget but is below the
+    escalation cap: raise the task's per-task ``max_iterations`` and re-queue it
+    to ``ready`` for a fresh spawn at the higher budget — WITHOUT counting a
+    failure (the shortfall is being granted more room, not a worker fault, so
+    the circuit breaker must not advance toward auto-block).
+
+    Mirrors :func:`reclaim_task`'s transitions but does NOT terminate the worker
+    (the caller IS the worker, already finishing) and clears the failure counter
+    so the retry starts clean. Returns True iff re-queued, else False (the caller
+    falls back to the normal failure/block path).
+    """
+    row = conn.execute(
+        "SELECT status, claim_lock FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if not row or row["status"] != "running":
+        return False
+    prev_lock = row["claim_lock"]
+    try:
+        new_budget = int(new_max_iterations)
+    except (TypeError, ValueError):
+        return False
+    if new_budget < 1:
+        return False
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, max_iterations = ? "
+            "WHERE id = ? AND status = 'running' AND claim_lock IS ?",
+            (new_budget, task_id, prev_lock),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn, task_id,
+            outcome="budget_escalated", status="budget_escalated",
+            error=(reason or "iteration budget escalated"),
+        )
+        _append_event(
+            conn, task_id, "budget_escalated",
+            {"new_max_iterations": new_budget, "reason": reason},
+            run_id=run_id,
+        )
+    # Exhaustion is being resolved with more budget, not punished — give the
+    # fresh spawn a clean failure counter (same rationale as reclaim_task).
+    _clear_failure_counter(conn, task_id)
+    return True
+
+
 def reassign_task(
     conn: sqlite3.Connection,
     task_id: str,
